@@ -141,6 +141,12 @@ fn bucle(inner: Compartido, poner: Arc<Poner>, poniendo: Arc<Mutex<()>>, gen: u6
         if !puesto {
             // En pausa antes de poner: esperar a reanudar (o a que nos reemplacen) y reintentar.
             while e.generacion == gen && e.pausado {
+                if e.saltar {
+                    // `siguiente` en pausa: poner ya la imagen que toca.
+                    e.saltar = false;
+                    forzar = true;
+                    break;
+                }
                 e = cv.wait(e).unwrap();
             }
             continue;
@@ -181,19 +187,25 @@ mod tests {
 
     /// Rotador cuyo `poner` manda cada ruta por un canal en vez de tocar Windows.
     fn grabador() -> (Receiver<PathBuf>, Rotador) {
-        grabador_lento(Duration::ZERO)
+        let (rx, _empezo, r) = grabador_lento(Duration::ZERO);
+        (rx, r)
     }
 
     /// Igual, pero `poner` tarda `demora` y recién después avisa (simula un `poner` en curso).
-    fn grabador_lento(demora: Duration) -> (Receiver<PathBuf>, Rotador) {
+    /// El segundo receptor avisa cuando un `poner` ARRANCÓ (antes de la demora): sirve de
+    /// handshake para saber, sin adivinar con `sleep`, que hay uno en vuelo.
+    fn grabador_lento(demora: Duration) -> (Receiver<PathBuf>, Receiver<()>, Rotador) {
         let (tx, rx) = channel();
+        let (tx_empezo, rx_empezo) = channel();
         let tx = Mutex::new(tx);
+        let tx_empezo = Mutex::new(tx_empezo);
         let r = Rotador::nuevo(move |p: &Path| {
+            let _ = tx_empezo.lock().unwrap().send(()); // si nadie escucha el handshake, da igual
             sleep(demora);
             tx.lock().unwrap().send(p.to_path_buf()).unwrap();
             Ok(())
         });
-        (rx, r)
+        (rx, rx_empezo, r)
     }
 
     fn lista(prefijo: &str, n: usize) -> Vec<PathBuf> {
@@ -226,6 +238,20 @@ mod tests {
         assert_eq!(esperar(&rx), lista("a", 2)[1]);
         sleep(ms(50));
         assert!(rx.try_recv().is_err(), "no debería haber más cambios");
+        r.detener();
+    }
+
+    #[test]
+    fn siguiente_en_pausa_avanza_una_imagen() {
+        let (rx, r) = grabador();
+        r.iniciar(lista("a", 3), Duration::from_secs(10));
+        assert_eq!(esperar(&rx), lista("a", 1)[0]);
+        r.pausar();
+        r.siguiente();
+        assert_eq!(esperar(&rx), lista("a", 2)[1]);
+        sleep(ms(50));
+        assert!(rx.try_recv().is_err(), "sigue en pausa después de saltar");
+        assert!(r.pausado());
         r.detener();
     }
 
@@ -282,9 +308,9 @@ mod tests {
 
     #[test]
     fn detener_espera_al_poner_en_curso() {
-        let (rx, r) = grabador_lento(ms(100));
+        let (rx, empezo, r) = grabador_lento(ms(100));
         r.iniciar(lista("a", 3), ms(5));
-        sleep(ms(20)); // el primer `poner` está en vuelo
+        empezo.recv_timeout(ESPERA).unwrap(); // el primer `poner` está en vuelo
         r.detener();
         // Al volver `detener` el `poner` en curso ya terminó y no vendrá otro.
         assert_eq!(rx.try_iter().count(), 1);
@@ -294,9 +320,9 @@ mod tests {
 
     #[test]
     fn pausar_espera_al_poner_en_curso() {
-        let (rx, r) = grabador_lento(ms(100));
+        let (rx, empezo, r) = grabador_lento(ms(100));
         r.iniciar(lista("a", 3), ms(5));
-        sleep(ms(20));
+        empezo.recv_timeout(ESPERA).unwrap(); // el primer `poner` está en vuelo
         r.pausar();
         assert_eq!(rx.try_iter().count(), 1);
         sleep(ms(300));
