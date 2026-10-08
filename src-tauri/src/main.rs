@@ -10,12 +10,13 @@ fn main() {
         .plugin(tauri_plugin_single_instance::init(|_, _, _| {}))
         .plugin(tauri_plugin_dialog::init())
         .setup(|a| {
-            let estado = app::App::nuevo()?;
+            let (estado, mut avisos) = app::App::nuevo();
             if let Err(e) = estado.retomar() {
-                eprintln!("no se pudo retomar la rotación: {e:#}");
+                avisos.push(format!("no se pudo retomar la rotación: {e:#}"));
             }
             a.manage(estado);
             bandeja::crear(a.handle())?;
+            bandeja::avisar_arranque(a.handle(), &avisos);
             Ok(())
         })
         .build(tauri::generate_context!())

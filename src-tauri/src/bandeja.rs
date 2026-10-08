@@ -9,76 +9,105 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 const ID: &str = "principal";
 
-fn construir_menu(h: &AppHandle, app: &App) -> tauri::Result<Menu<Wry>> {
-    let menu = Menu::new(h)?;
+/// Todo lo que el menú necesita, ya leído del disco. Se arma fuera del hilo de la interfaz.
+struct DatosMenu {
+    /// (id, etiqueta, tema válido)
+    temas: Vec<(String, String, bool)>,
+    activo: Option<String>,
+    rota: bool,
+    pausado: bool,
+    tooltip: String,
+}
+
+fn datos_menu(app: &App) -> DatosMenu {
     let activo = app.estado().tema_activo;
-    let temas = app.temas();
-    if temas.is_empty() {
+    let temas: Vec<(String, String, bool)> = app
+        .temas()
+        .into_iter()
+        .map(|(id, t)| match t {
+            Ok(t) => (id, t.conf.nombre, true),
+            Err(_) => {
+                let etiqueta = format!("{id} (tema.json con errores)");
+                (id, etiqueta, false)
+            }
+        })
+        .collect();
+    let tooltip = match &activo {
+        Some(id) => {
+            let nombre = temas.iter().find(|(i, _, ok)| i == id && *ok).map(|(_, n, _)| n.as_str());
+            format!("Temas — {}", nombre.unwrap_or(id))
+        }
+        None => "Temas — original".into(),
+    };
+    DatosMenu { temas, activo, rota: app.rotador.activo(), pausado: app.rotador.pausado(), tooltip }
+}
+
+fn construir_menu(h: &AppHandle, d: &DatosMenu) -> tauri::Result<Menu<Wry>> {
+    let menu = Menu::new(h)?;
+    if d.temas.is_empty() {
         menu.append(&MenuItem::with_id(h, "nada", "(no hay temas en la carpeta)", false, None::<&str>)?)?;
     }
-    for (id, t) in &temas {
-        match t {
-            Ok(t) => menu.append(&CheckMenuItem::with_id(
+    for (id, etiqueta, ok) in &d.temas {
+        if *ok {
+            menu.append(&CheckMenuItem::with_id(
                 h,
                 format!("tema:{id}"),
-                &t.conf.nombre,
+                etiqueta,
                 true,
-                activo.as_deref() == Some(id.as_str()),
+                d.activo.as_deref() == Some(id.as_str()),
                 None::<&str>,
-            )?)?,
-            Err(_) => menu.append(&MenuItem::with_id(
-                h,
-                format!("roto:{id}"),
-                format!("{id} (tema.json con errores)"),
-                true,
-                None::<&str>,
-            )?)?,
+            )?)?;
+        } else {
+            menu.append(&MenuItem::with_id(h, format!("roto:{id}"), etiqueta, true, None::<&str>)?)?;
         }
     }
     menu.append(&PredefinedMenuItem::separator(h)?)?;
-    let rota = app.rotador.activo();
-    let pausa = if app.rotador.pausado() { "Reanudar fondos" } else { "Pausar fondos" };
-    menu.append(&MenuItem::with_id(h, "siguiente", "Siguiente fondo", rota, None::<&str>)?)?;
-    menu.append(&MenuItem::with_id(h, "pausa", pausa, rota, None::<&str>)?)?;
+    let pausa = if d.pausado { "Reanudar fondos" } else { "Pausar fondos" };
+    menu.append(&MenuItem::with_id(h, "siguiente", "Siguiente fondo", d.rota, None::<&str>)?)?;
+    menu.append(&MenuItem::with_id(h, "pausa", pausa, d.rota, None::<&str>)?)?;
     menu.append(&MenuItem::with_id(h, "restaurar", "Restaurar original", true, None::<&str>)?)?;
     menu.append(&PredefinedMenuItem::separator(h)?)?;
     menu.append(&MenuItem::with_id(h, "salir", "Salir", true, None::<&str>)?)?;
     Ok(menu)
 }
 
-fn tooltip(app: &App) -> String {
-    match app.nombre_activo() {
-        Some(n) => format!("Temas — {n}"),
-        None => "Temas — original".into(),
-    }
-}
-
 pub fn crear(h: &AppHandle) -> tauri::Result<()> {
     let app = h.state::<App>();
+    let datos = datos_menu(&app);
     let icono = h.default_window_icon().expect("falta el ícono de la app").clone();
     TrayIconBuilder::with_id(ID)
         .icon(icono)
-        .tooltip(tooltip(&app))
-        .menu(&construir_menu(h, &app)?)
+        .tooltip(&datos.tooltip)
+        .menu(&construir_menu(h, &datos)?)
         .show_menu_on_left_click(true)
         .on_menu_event(|h, ev| manejar(h, ev.id().as_ref()))
         .build(h)?;
     Ok(())
 }
 
+/// Vuelve a leer el estado en el hilo que llama; el hilo de la interfaz sólo arma los widgets.
 fn refrescar(h: &AppHandle) {
+    let datos = datos_menu(&h.state::<App>());
     let h2 = h.clone();
     let _ = h.run_on_main_thread(move || {
-        let app = h2.state::<App>();
-        if let (Some(tray), Ok(menu)) = (h2.tray_by_id(ID), construir_menu(&h2, &app)) {
+        if let (Some(tray), Ok(menu)) = (h2.tray_by_id(ID), construir_menu(&h2, &datos)) {
             let _ = tray.set_menu(Some(menu));
-            let _ = tray.set_tooltip(Some(tooltip(&app)));
+            let _ = tray.set_tooltip(Some(&datos.tooltip));
         }
     });
 }
 
 fn avisar(h: &AppHandle, titulo: &str, texto: String, tipo: MessageDialogKind) {
     h.dialog().message(texto).title(titulo).kind(tipo).show(|_| {});
+}
+
+/// Avisos juntados durante el arranque (ajustes ilegibles, rotación que no se pudo retomar…).
+pub fn avisar_arranque(h: &AppHandle, avisos: &[String]) {
+    if !avisos.is_empty() {
+        avisar(h, "Temas — avisos al arrancar", avisos.join("
+
+"), MessageDialogKind::Warning);
+    }
 }
 
 fn informar(h: &AppHandle, r: anyhow::Result<Informe>) {
@@ -102,9 +131,15 @@ fn manejar(h: &AppHandle, id: &str) {
         } else {
             match id.as_str() {
                 "siguiente" => app.rotador.siguiente(),
-                "pausa" => app.alternar_pausa(),
+                "pausa" => {
+                    if let Err(e) = app.alternar_pausa() {
+                        avisar(&h, "Temas — error", format!("no se pudo guardar la pausa: {e:#}"), MessageDialogKind::Error);
+                    }
+                }
                 "restaurar" => informar(&h, app.restaurar()),
                 "salir" => {
+                    // Si hay una aplicación o restauración en curso, se espera a que termine.
+                    let _g = app.bloquear();
                     h.exit(0);
                     return;
                 }

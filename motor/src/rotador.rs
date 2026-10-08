@@ -52,6 +52,16 @@ impl Rotador {
     }
 
     pub fn iniciar(&self, lista: Vec<PathBuf>, intervalo: Duration) {
+        self.arrancar(lista, intervalo, false);
+    }
+
+    /// Igual que `iniciar`, pero arranca en pausa: no se pone ninguna imagen hasta `reanudar`
+    /// (un `siguiente` sí pone una, y se queda en pausa).
+    pub fn iniciar_en_pausa(&self, lista: Vec<PathBuf>, intervalo: Duration) {
+        self.arrancar(lista, intervalo, true);
+    }
+
+    fn arrancar(&self, lista: Vec<PathBuf>, intervalo: Duration, pausado: bool) {
         let (m, cv) = &*self.inner;
         let vacia = lista.is_empty();
         let gen = {
@@ -60,7 +70,7 @@ impl Rotador {
             e.lista = lista;
             e.indice = 0;
             e.intervalo = intervalo;
-            e.pausado = false;
+            e.pausado = pausado;
             e.saltar = false;
             e.generacion
         };
@@ -294,6 +304,33 @@ mod tests {
         sleep(ms(50));
         assert!(rx.try_recv().is_err(), "la rotación vieja no debe seguir");
         assert!(r.activo());
+        r.detener();
+    }
+
+    #[test]
+    fn iniciar_en_pausa_no_pone_nada_hasta_reanudar() {
+        let (rx, r) = grabador();
+        r.iniciar_en_pausa(lista("a", 3), Duration::from_secs(10));
+        assert!(r.pausado());
+        assert!(r.activo());
+        sleep(ms(100));
+        assert!(rx.try_recv().is_err(), "en pausa no se pone nada");
+        r.reanudar();
+        assert_eq!(esperar(&rx), lista("a", 1)[0]);
+        r.detener();
+    }
+
+    #[test]
+    fn siguiente_en_pausa_desde_el_arranque_pone_una_imagen() {
+        let (rx, r) = grabador();
+        r.iniciar_en_pausa(lista("a", 3), Duration::from_secs(10));
+        sleep(ms(50));
+        assert!(rx.try_recv().is_err());
+        r.siguiente();
+        esperar(&rx);
+        sleep(ms(50));
+        assert!(rx.try_recv().is_err(), "sigue en pausa después de saltar");
+        assert!(r.pausado());
         r.detener();
     }
 
