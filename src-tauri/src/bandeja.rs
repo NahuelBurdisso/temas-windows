@@ -87,7 +87,13 @@ pub fn crear(h: &AppHandle) -> tauri::Result<()> {
 
 /// Vuelve a leer el estado en el hilo que llama; el hilo de la interfaz sólo arma los widgets.
 fn refrescar(h: &AppHandle) {
-    let datos = datos_menu(&h.state::<App>());
+    let datos = {
+        // Con el candado tomado, una lectura vieja no puede publicarse después de una nueva
+        // (las acciones también lo toman). Se suelta antes de pasar a la interfaz.
+        let app = h.state::<App>();
+        let _g = app.bloquear();
+        datos_menu(&app)
+    };
     let h2 = h.clone();
     let _ = h.run_on_main_thread(move || {
         if let (Some(tray), Ok(menu)) = (h2.tray_by_id(ID), construir_menu(&h2, &datos)) {
@@ -104,9 +110,7 @@ fn avisar(h: &AppHandle, titulo: &str, texto: String, tipo: MessageDialogKind) {
 /// Avisos juntados durante el arranque (ajustes ilegibles, rotación que no se pudo retomar…).
 pub fn avisar_arranque(h: &AppHandle, avisos: &[String]) {
     if !avisos.is_empty() {
-        avisar(h, "Temas — avisos al arrancar", avisos.join("
-
-"), MessageDialogKind::Warning);
+        avisar(h, "Temas — avisos al arrancar", avisos.join("\n\n"), MessageDialogKind::Warning);
     }
 }
 
@@ -138,8 +142,11 @@ fn manejar(h: &AppHandle, id: &str) {
                 }
                 "restaurar" => informar(&h, app.restaurar()),
                 "salir" => {
-                    // Si hay una aplicación o restauración en curso, se espera a que termine.
-                    let _g = app.bloquear();
+                    // Si hay una aplicación o restauración en curso, se espera a que termine,
+                    // y el candado queda tomado para siempre: ninguna acción nueva arranca.
+                    std::mem::forget(app.bloquear());
+                    // Espera a que termine el cambio de fondo en vuelo (si hay) y frena la rotación.
+                    app.rotador.pausar();
                     h.exit(0);
                     return;
                 }

@@ -39,8 +39,10 @@ impl App {
         };
         let rotador = Arc::new(Rotador::nuevo(win::poner_fondo));
         let modulos: Vec<Box<dyn Modulo>> = vec![
-            Box::new(Fondos { rotador: rotador.clone(), raiz: rutas.raiz.clone() }),
+            // Colores primero: así `AutoColorization=0` ya está escrito cuando el rotador
+            // pone el primer fondo.
             Box::new(Colores),
+            Box::new(Fondos { rotador: rotador.clone(), raiz: rutas.raiz.clone() }),
             Box::new(Bloqueo),
             Box::new(Terminal::por_defecto()),
         ];
@@ -116,6 +118,10 @@ impl App {
             return Ok(());
         }
         let tema = Tema::cargar(&self.ajustes.carpeta_temas.join(&id))?;
+        if !tema.define("fondos") {
+            // Puede figurar en `tocados` sólo porque falta restaurarlo: no hay nada que rotar.
+            return Ok(());
+        }
         let (lista, intervalo) = fondos::lista_de(&tema)?;
         if e.fondos_pausados {
             self.rotador.iniciar_en_pausa(lista, intervalo);

@@ -87,6 +87,8 @@ impl Modulo for Fondos {
     }
 
     fn aplicar(&self, tema: &Tema) -> Result<()> {
+        // Antes de cualquier `?`: un aplicar fallido nunca deja rotando el tema anterior.
+        self.rotador.detener();
         let conf = tema.conf.fondos.as_ref().context("el tema no define fondos")?;
         let (lista, intervalo) = lista_de(tema)?;
         escribir_estilo(&RegValor::Sz(conf.estilo.wallpaper_style().into()), &RegValor::Sz("0".into()))?;
@@ -111,6 +113,23 @@ impl Modulo for Fondos {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn aplicar_fallido_no_deja_rotando_el_tema_anterior() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("sin-fondos");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tema.json"), json!({"nombre": "Sin fondos"}).to_string()).unwrap();
+        let tema = Tema::cargar(&dir).unwrap();
+
+        let rotador = Arc::new(Rotador::nuevo(|_: &Path| Ok(())));
+        rotador.iniciar(vec![PathBuf::from("a.jpg")], Duration::from_secs(60));
+        assert!(rotador.activo());
+        let fondos = Fondos { rotador: rotador.clone(), raiz: t.path().into() };
+
+        assert!(fondos.aplicar(&tema).is_err());
+        assert!(!rotador.activo(), "un aplicar fallido no debe dejar rotando el tema anterior");
+    }
 
     #[test]
     fn ordenar_alfabetico_conserva_y_aleatorio_mezcla_los_mismos() {

@@ -65,7 +65,7 @@ impl Rotador {
         let (m, cv) = &*self.inner;
         let vacia = lista.is_empty();
         let gen = {
-            let mut e = m.lock().unwrap();
+            let mut e = tomar(m);
             e.generacion += 1;
             e.lista = lista;
             e.indice = 0;
@@ -105,15 +105,15 @@ impl Rotador {
         self.esperar_poner();
     }
     pub fn activo(&self) -> bool {
-        !self.inner.0.lock().unwrap().lista.is_empty()
+        !tomar(&self.inner.0).lista.is_empty()
     }
     pub fn pausado(&self) -> bool {
-        self.inner.0.lock().unwrap().pausado
+        tomar(&self.inner.0).pausado
     }
 
     fn cambiar(&self, f: impl FnOnce(&mut Estado)) {
         let (m, cv) = &*self.inner;
-        f(&mut m.lock().unwrap());
+        f(&mut tomar(m));
         cv.notify_all();
     }
 
@@ -131,7 +131,7 @@ fn bucle(inner: Compartido, poner: Arc<Poner>, poniendo: Arc<Mutex<()>>, gen: u6
     loop {
         let puesto = {
             let _p = tomar(&poniendo);
-            let e = m.lock().unwrap();
+            let e = tomar(m);
             if e.generacion != gen {
                 return;
             }
@@ -147,7 +147,7 @@ fn bucle(inner: Compartido, poner: Arc<Poner>, poniendo: Arc<Mutex<()>>, gen: u6
             }
         };
         forzar = false;
-        let mut e = m.lock().unwrap();
+        let mut e = tomar(m);
         if !puesto {
             // En pausa antes de poner: esperar a reanudar (o a que nos reemplacen) y reintentar.
             while e.generacion == gen && e.pausado {
@@ -157,7 +157,7 @@ fn bucle(inner: Compartido, poner: Arc<Poner>, poniendo: Arc<Mutex<()>>, gen: u6
                     forzar = true;
                     break;
                 }
-                e = cv.wait(e).unwrap();
+                e = cv.wait(e).unwrap_or_else(|p| p.into_inner());
             }
             continue;
         }
@@ -172,7 +172,7 @@ fn bucle(inner: Compartido, poner: Arc<Poner>, poniendo: Arc<Mutex<()>>, gen: u6
                 break;
             }
             if e.pausado {
-                e = cv.wait(e).unwrap();
+                e = cv.wait(e).unwrap_or_else(|p| p.into_inner());
                 limite = limite_desde(e.intervalo);
                 continue;
             }
@@ -180,7 +180,7 @@ fn bucle(inner: Compartido, poner: Arc<Poner>, poniendo: Arc<Mutex<()>>, gen: u6
             if ahora >= limite {
                 break;
             }
-            e = cv.wait_timeout(e, limite - ahora).unwrap().0;
+            e = cv.wait_timeout(e, limite - ahora).unwrap_or_else(|p| p.into_inner()).0;
         }
         e.indice = (e.indice + 1) % e.lista.len();
     }
@@ -331,6 +331,22 @@ mod tests {
         sleep(ms(50));
         assert!(rx.try_recv().is_err(), "sigue en pausa después de saltar");
         assert!(r.pausado());
+        r.detener();
+    }
+
+    #[test]
+    fn un_mutex_envenenado_no_tumba_al_rotador() {
+        let (_rx, r) = grabador();
+        let inner = r.inner.clone();
+        let _ = thread::spawn(move || {
+            let _g = inner.0.lock().unwrap();
+            panic!("envenenar el mutex a propósito");
+        })
+        .join();
+        assert!(!r.activo());
+        assert!(!r.pausado());
+        r.iniciar(lista("a", 2), Duration::from_secs(10));
+        assert!(r.activo());
         r.detener();
     }
 
