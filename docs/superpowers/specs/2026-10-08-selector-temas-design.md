@@ -214,6 +214,11 @@ Cada etapa termina en algo usable.
    el menú Inicio y las barras de título cambian en vivo sin cerrar sesión; al restaurar vuelve todo. Sin ajustes.
    Resultado del spike de bloqueo (2026-10-08): `LockScreen.SetImageFileAsync` funciona sin admin desde la app sin
    empaquetar; Win+L muestra la imagen del tema y al restaurar vuelve la pantalla de bloqueo anterior. Sin ajustes.
+   **Etapa 1 terminada (2026-10-08).** Verificada en vivo con el usuario: Star Wars y Game of Thrones aplican fondos
+   rotativos, colores, bloqueo y terminal; siguiente/pausa/reanudar; al reabrir retoma el tema; "Restaurar original"
+   vuelve todo, incluido Windows Spotlight. Pruebas de ida y vuelta contra Windows real: 3/3. Desvíos: el ícono de
+   bandeja no muestra la inicial del tema (se usa el tooltip); la restauración de bloqueo pone la imagen capturada y
+   después las claves de Spotlight (verificado: Spotlight se reactiva).
 2. **Galería + instalador**: ventana, detalle, casillas por módulo, "Nuevo tema", Ajustes, autostart, instalador NSIS en `D:\Programas\`.
 3. **Sonidos + intro.**
 4. **Íconos + protector de pantalla** (presentación y crawl).
