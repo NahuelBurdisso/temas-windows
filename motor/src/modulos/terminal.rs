@@ -3,7 +3,7 @@
 use super::Modulo;
 use crate::tema::{Tema, TerminalConf};
 use anyhow::{bail, Context, Result};
-use jsonc_parser::cst::{CstInputValue, CstNode, CstRootNode};
+use jsonc_parser::cst::{CstInputValue, CstNode, CstObject, CstRootNode};
 use jsonc_parser::ParseOptions;
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
@@ -55,13 +55,19 @@ fn a_cst(v: &Value) -> CstInputValue {
     }
 }
 
-fn es_nuestro(nodo: &CstNode) -> bool {
-    nodo.as_object()
-        .and_then(|o| o.get("name"))
-        .and_then(|p| p.value())
+/// ¿El valor es el texto `NOMBRE_ESQUEMA`?
+fn valor_es_nuestro(valor: Option<CstNode>) -> bool {
+    valor
         .and_then(|v| v.as_string_lit())
         .and_then(|s| s.decoded_value().ok())
         .map(|n| n == NOMBRE_ESQUEMA)
+        .unwrap_or(false)
+}
+
+fn es_nuestro(nodo: &CstNode) -> bool {
+    nodo.as_object()
+        .and_then(|o| o.get("name"))
+        .map(|p| valor_es_nuestro(p.value()))
         .unwrap_or(false)
 }
 
@@ -75,13 +81,32 @@ fn quitar_nuestro(raiz: &CstRootNode) {
     }
 }
 
+/// Falla si la propiedad existe pero su valor no es un objeto.
+fn exigir_objeto(obj: &CstObject, nombre: &str, donde: &str) -> Result<()> {
+    if let Some(p) = obj.get(nombre) {
+        if p.value().and_then(|v| v.as_object()).is_none() {
+            bail!("\"{nombre}\" en {donde} no es un objeto; no se modifica");
+        }
+    }
+    Ok(())
+}
+
 pub fn aplicar_texto(texto: &str, esquema: &Value) -> Result<String> {
     let raiz = CstRootNode::parse(texto, &opciones())?;
-    let obj = raiz.object_value_or_set();
-    if let Some(p) = obj.get("profiles") {
-        if p.value().and_then(|v| v.as_object()).is_none() {
-            bail!("\"profiles\" tiene el formato antiguo (lista); no soportado");
+    if let Some(v) = raiz.value() {
+        if v.as_object().is_none() {
+            bail!("la raíz de settings.json no es un objeto; no se modifica");
         }
+    }
+    let obj = raiz.object_value_or_set();
+    if let Some(p) = obj.get("schemes") {
+        if p.value().and_then(|v| v.as_array()).is_none() {
+            bail!("\"schemes\" no es una lista; no se modifica");
+        }
+    }
+    exigir_objeto(&obj, "profiles", "la raíz")?;
+    if let Some(perfiles) = obj.object_value("profiles") {
+        exigir_objeto(&perfiles, "defaults", "\"profiles\"")?;
     }
     quitar_nuestro(&raiz);
     obj.array_value_or_set("schemes").append(a_cst(esquema));
@@ -96,6 +121,8 @@ pub fn aplicar_texto(texto: &str, esquema: &Value) -> Result<String> {
     Ok(raiz.to_string())
 }
 
+/// Quita nuestro esquema y devuelve `colorScheme` a `previo`, pero sólo si sigue siendo el
+/// nuestro (o falta). Si el usuario eligió otro mientras tanto, se lo respeta.
 pub fn restaurar_texto(texto: &str, previo: Option<&Value>) -> Result<String> {
     let raiz = CstRootNode::parse(texto, &opciones())?;
     quitar_nuestro(&raiz);
@@ -104,21 +131,65 @@ pub fn restaurar_texto(texto: &str, previo: Option<&Value>) -> Result<String> {
         .and_then(|o| o.object_value("profiles"))
         .and_then(|p| p.object_value("defaults"));
     if let Some(d) = defaults {
-        match (previo, d.get("colorScheme")) {
-            (Some(v), Some(p)) => p.set_value(a_cst(v)),
-            (Some(v), None) => {
-                d.append("colorScheme", a_cst(v));
+        match d.get("colorScheme") {
+            Some(p) => {
+                if valor_es_nuestro(p.value()) {
+                    match previo {
+                        Some(v) => p.set_value(a_cst(v)),
+                        None => p.remove(),
+                    }
+                }
             }
-            (None, Some(p)) => p.remove(),
-            (None, None) => {}
+            None => {
+                if let Some(v) = previo {
+                    d.append("colorScheme", a_cst(v));
+                }
+            }
         }
     }
     Ok(raiz.to_string())
 }
 
-fn leer(ruta: &Path) -> Result<String> {
+/// Para archivos que no estaban al capturar: quita lo nuestro, sin valor previo que reponer.
+pub fn limpiar_texto(texto: &str) -> Result<String> {
+    restaurar_texto(texto, None)
+}
+
+/// Escribe en `<nombre>.tmp` junto al destino y lo renombra encima, así un corte a mitad de
+/// escritura nunca deja el archivo truncado. Si `ruta` es un enlace simbólico se escribe sobre
+/// el destino real, no se reemplaza el enlace.
+fn escribir_atomico(ruta: &Path, texto: &str) -> Result<()> {
+    let destino = std::fs::canonicalize(ruta).unwrap_or_else(|_| ruta.to_path_buf());
+    let nombre = destino.file_name().context("ruta sin nombre de archivo")?;
+    let mut nombre_tmp = nombre.to_os_string();
+    nombre_tmp.push(".tmp");
+    let tmp = destino.with_file_name(nombre_tmp);
+    let r = std::fs::write(&tmp, texto)
+        .and_then(|_| std::fs::rename(&tmp, &destino))
+        .with_context(|| format!("escribir {}", ruta.display()));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
+}
+
+/// Lee el archivo y devuelve el texto sin BOM y si lo tenía.
+fn leer(ruta: &Path) -> Result<(String, bool)> {
     let t = std::fs::read_to_string(ruta).with_context(|| format!("leer {}", ruta.display()))?;
-    Ok(t.trim_start_matches('\u{feff}').to_string())
+    let bom = t.starts_with('\u{feff}');
+    Ok((t.trim_start_matches('\u{feff}').to_string(), bom))
+}
+
+/// Lee `ruta`, la transforma y la reescribe de forma atómica conservando el BOM.
+/// No toca el archivo si no hay cambios.
+fn transformar(ruta: &Path, f: impl FnOnce(&str) -> Result<String>) -> Result<()> {
+    let (texto, bom) = leer(ruta)?;
+    let nuevo = f(&texto)?;
+    if nuevo == texto {
+        return Ok(());
+    }
+    let salida = if bom { format!("\u{feff}{nuevo}") } else { nuevo };
+    escribir_atomico(ruta, &salida)
 }
 
 pub struct Terminal {
@@ -152,7 +223,9 @@ impl Modulo for Terminal {
     fn capturar(&self, _dir: &Path) -> Result<Value> {
         let mut lista = vec![];
         for p in self.existentes() {
-            lista.push(json!({ "ruta": p, "colorScheme": esquema_defecto(&leer(p)?)? }));
+            let (texto, _) = leer(p)?;
+            let previo = esquema_defecto(&texto).with_context(|| format!("{}", p.display()))?;
+            lista.push(json!({ "ruta": p, "colorScheme": previo }));
         }
         Ok(Value::Array(lista))
     }
@@ -167,8 +240,7 @@ impl Modulo for Terminal {
                 if !bak.exists() {
                     std::fs::copy(p, &bak)?;
                 }
-                std::fs::write(p, aplicar_texto(&leer(p)?, &esquema)?)?;
-                Ok(())
+                transformar(p, |t| aplicar_texto(t, &esquema))
             })();
             if let Err(e) = r {
                 errores.push(format!("{}: {e:#}", p.display()));
@@ -180,15 +252,36 @@ impl Modulo for Terminal {
         Ok(())
     }
 
+    /// Sigue con los demás archivos aunque uno falle, y devuelve todos los errores juntos.
+    /// También limpia los archivos que aparecieron después de capturar.
     fn restaurar(&self, captura: &Value, _dir: &Path) -> Result<()> {
         let lista = captura.as_array().context("captura de terminal inválida")?;
+        let mut errores = vec![];
+        let mut capturadas: Vec<PathBuf> = vec![];
         for item in lista {
-            let ruta = PathBuf::from(item["ruta"].as_str().context("captura sin ruta")?);
+            let Some(ruta) = item["ruta"].as_str().map(PathBuf::from) else {
+                errores.push("captura sin ruta".to_string());
+                continue;
+            };
+            capturadas.push(ruta.clone());
             if !ruta.is_file() {
                 continue;
             }
             let previo = item.get("colorScheme").filter(|v| !v.is_null());
-            std::fs::write(&ruta, restaurar_texto(&leer(&ruta)?, previo)?)?;
+            if let Err(e) = transformar(&ruta, |t| restaurar_texto(t, previo)) {
+                errores.push(format!("{}: {e:#}", ruta.display()));
+            }
+        }
+        for p in self.existentes() {
+            if capturadas.contains(p) {
+                continue;
+            }
+            if let Err(e) = transformar(p, limpiar_texto) {
+                errores.push(format!("{}: {e:#}", p.display()));
+            }
+        }
+        if !errores.is_empty() {
+            bail!(errores.join("; "));
         }
         Ok(())
     }
@@ -320,5 +413,180 @@ mod tests {
         std::fs::write(dir.join("tema.json"), conf.to_string()).unwrap();
         m.aplicar(&Tema::cargar(&dir).unwrap()).unwrap();
         m.restaurar(&captura, Path::new(".")).unwrap();
+    }
+
+    fn tema_simple(base: &Path) -> Tema {
+        let dir = base.join("tema");
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = json!({"nombre": "T", "terminal": {"fondo": "#000000", "texto": "#FFFFFF", "cursor": "#FFFFFF"}});
+        std::fs::write(dir.join("tema.json"), conf.to_string()).unwrap();
+        Tema::cargar(&dir).unwrap()
+    }
+
+    fn leer_json(ruta: &Path) -> Value {
+        parsear(std::fs::read_to_string(ruta).unwrap().trim_start_matches('\u{feff}'))
+    }
+
+    #[test]
+    fn restaurar_junta_errores_y_restaura_los_otros_archivos() {
+        let t = tempfile::tempdir().unwrap();
+        let a = t.path().join("a.json");
+        let b = t.path().join("b.json");
+        std::fs::write(&a, SETTINGS).unwrap();
+        std::fs::write(&b, SETTINGS).unwrap();
+        let m = Terminal { candidatos: vec![a.clone(), b.clone()] };
+        let tema = tema_simple(t.path());
+
+        let captura = m.capturar(t.path()).unwrap();
+        m.aplicar(&tema).unwrap();
+        std::fs::write(&a, "{{{ esto no es json").unwrap();
+
+        let err = m.restaurar(&captura, t.path()).unwrap_err();
+        assert!(format!("{err:#}").contains(&a.display().to_string()), "el error nombra el archivo roto: {err:#}");
+        let vb = leer_json(&b);
+        assert_eq!(nuestros(&vb), 0);
+        assert_eq!(vb["profiles"]["defaults"]["colorScheme"], "One Half Dark");
+    }
+
+    #[test]
+    fn restaurar_limpia_archivos_que_aparecieron_despues_de_capturar() {
+        let t = tempfile::tempdir().unwrap();
+        let a = t.path().join("a.json");
+        let b = t.path().join("b.json");
+        std::fs::write(&a, SETTINGS).unwrap();
+        let m = Terminal { candidatos: vec![a.clone(), b.clone()] };
+        let tema = tema_simple(t.path());
+
+        let captura = m.capturar(t.path()).unwrap();
+        assert_eq!(captura.as_array().unwrap().len(), 1);
+        std::fs::write(&b, SETTINGS).unwrap(); // aparece después de capturar
+        m.aplicar(&tema).unwrap();
+        assert_eq!(leer_json(&b)["profiles"]["defaults"]["colorScheme"], NOMBRE_ESQUEMA);
+
+        m.restaurar(&captura, t.path()).unwrap();
+        let vb = leer_json(&b);
+        assert_eq!(nuestros(&vb), 0);
+        assert!(vb["profiles"]["defaults"].get("colorScheme").is_none());
+        assert_eq!(leer_json(&a), parsear(SETTINGS));
+    }
+
+    #[test]
+    fn restaurar_respeta_el_esquema_que_el_usuario_eligio_despues() {
+        let aplicado = aplicar_texto(SETTINGS, &esquema_para(&conf())).unwrap();
+        let usuario = aplicado.replace(&format!("\"colorScheme\": \"{NOMBRE_ESQUEMA}\""), "\"colorScheme\": \"Solarized\"");
+        assert_ne!(usuario, aplicado);
+
+        for previo in [Some(json!("One Half Dark")), None] {
+            let v = parsear(&restaurar_texto(&usuario, previo.as_ref()).unwrap());
+            assert_eq!(nuestros(&v), 0, "nuestro esquema se quita siempre");
+            assert_eq!(v["profiles"]["defaults"]["colorScheme"], "Solarized");
+        }
+    }
+
+    #[test]
+    fn restaurar_repone_el_previo_si_el_defecto_desaparecio() {
+        let sin = r#"{"profiles": {"defaults": {}}, "schemes": []}"#;
+        let v = parsear(&restaurar_texto(sin, Some(&json!("X"))).unwrap());
+        assert_eq!(v["profiles"]["defaults"]["colorScheme"], "X");
+    }
+
+    #[test]
+    fn tipos_incorrectos_son_error_y_no_se_pisan() {
+        let e = esquema_para(&conf());
+        for malo in [
+            "[]",
+            "3",
+            r#"{"schemes": {}}"#,
+            r#"{"schemes": "x"}"#,
+            r#"{"profiles": []}"#,
+            r#"{"profiles": {"defaults": []}}"#,
+            r#"{"profiles": {"defaults": 5}}"#,
+        ] {
+            assert!(aplicar_texto(malo, &e).is_err(), "debería fallar con {malo}");
+        }
+        let msg = format!("{:#}", aplicar_texto(r#"{"profiles": []}"#, &e).unwrap_err());
+        assert!(msg.contains("profiles") && msg.contains("objeto"), "{msg}");
+    }
+
+    #[test]
+    fn esquemas_duplicados_se_quitan_todos() {
+        let dup = r#"{"schemes": [{"name": "Tema activo"}, {"name": "Mio"}, {"name": "Tema activo"}]}"#;
+        let v = parsear(&restaurar_texto(dup, None).unwrap());
+        assert_eq!(nuestros(&v), 0);
+        assert_eq!(v["schemes"].as_array().unwrap().len(), 1);
+        let v = parsear(&aplicar_texto(dup, &esquema_para(&conf())).unwrap());
+        assert_eq!(nuestros(&v), 1);
+        assert_eq!(v["schemes"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn esquema_defecto_en_forma_de_objeto_hace_ida_y_vuelta() {
+        let original = r#"{
+    "profiles": { "defaults": { "colorScheme": { "dark": "Campbell", "light": "One Half Light" } } },
+    "schemes": [],
+}"#;
+        let t = tempfile::tempdir().unwrap();
+        let archivo = t.path().join("settings.json");
+        std::fs::write(&archivo, original).unwrap();
+        let m = Terminal { candidatos: vec![archivo.clone()] };
+        let tema = tema_simple(t.path());
+
+        let captura = m.capturar(t.path()).unwrap();
+        m.aplicar(&tema).unwrap();
+        assert_eq!(leer_json(&archivo)["profiles"]["defaults"]["colorScheme"], NOMBRE_ESQUEMA);
+        m.restaurar(&captura, t.path()).unwrap();
+        assert_eq!(leer_json(&archivo), parsear(original));
+    }
+
+    #[test]
+    fn archivo_con_bom_conserva_el_bom() {
+        let t = tempfile::tempdir().unwrap();
+        let archivo = t.path().join("settings.json");
+        std::fs::write(&archivo, format!("\u{feff}{SETTINGS}")).unwrap();
+        let m = Terminal { candidatos: vec![archivo.clone()] };
+        let tema = tema_simple(t.path());
+
+        let captura = m.capturar(t.path()).unwrap();
+        m.aplicar(&tema).unwrap();
+        assert!(std::fs::read_to_string(&archivo).unwrap().starts_with('\u{feff}'));
+        m.restaurar(&captura, t.path()).unwrap();
+        let crudo = std::fs::read_to_string(&archivo).unwrap();
+        assert!(crudo.starts_with('\u{feff}'));
+        assert!(!crudo.starts_with("\u{feff}\u{feff}"));
+        assert_eq!(leer_json(&archivo), parsear(SETTINGS));
+    }
+
+    #[test]
+    fn un_archivo_sin_bom_no_gana_bom() {
+        let t = tempfile::tempdir().unwrap();
+        let archivo = t.path().join("settings.json");
+        std::fs::write(&archivo, SETTINGS).unwrap();
+        let m = Terminal { candidatos: vec![archivo.clone()] };
+        m.aplicar(&tema_simple(t.path())).unwrap();
+        assert!(!std::fs::read_to_string(&archivo).unwrap().starts_with('\u{feff}'));
+    }
+
+    #[test]
+    fn el_bak_se_crea_una_vez_y_no_se_pisa() {
+        let t = tempfile::tempdir().unwrap();
+        let archivo = t.path().join("settings.json");
+        std::fs::write(&archivo, SETTINGS).unwrap();
+        let m = Terminal { candidatos: vec![archivo.clone()] };
+        let tema = tema_simple(t.path());
+
+        m.aplicar(&tema).unwrap();
+        m.aplicar(&tema).unwrap();
+        assert_eq!(std::fs::read_to_string(t.path().join("settings.json.bak")).unwrap(), SETTINGS);
+    }
+
+    #[test]
+    fn escribir_atomico_reemplaza_y_no_deja_temporales() {
+        let t = tempfile::tempdir().unwrap();
+        let archivo = t.path().join("settings.json");
+        std::fs::write(&archivo, "viejo").unwrap();
+        escribir_atomico(&archivo, "nuevo").unwrap();
+        assert_eq!(std::fs::read_to_string(&archivo).unwrap(), "nuevo");
+        let nombres: Vec<_> = std::fs::read_dir(t.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(nombres.len(), 1, "sólo queda el archivo final: {nombres:?}");
     }
 }
