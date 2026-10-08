@@ -2,6 +2,7 @@
 pub mod color;
 pub mod estado;
 pub mod modulos;
+pub mod nucleo;
 pub mod registro;
 pub mod tema;
 pub mod win;
