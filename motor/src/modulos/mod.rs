@@ -3,6 +3,7 @@
 pub mod bloqueo;
 pub mod colores;
 pub mod fondos;
+pub mod terminal;
 
 use crate::tema::Tema;
 use anyhow::Result;
