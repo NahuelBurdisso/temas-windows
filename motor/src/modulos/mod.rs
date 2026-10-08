@@ -1,5 +1,6 @@
 //! Cada parte de Windows que un tema puede cambiar es un módulo.
 
+pub mod bloqueo;
 pub mod colores;
 
 use crate::tema::Tema;
