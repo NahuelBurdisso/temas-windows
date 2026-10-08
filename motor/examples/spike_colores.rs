@@ -22,13 +22,15 @@ fn main() -> anyhow::Result<()> {
     println!("Captura: {captura}");
     println!("Estado actual guardado. Aplicando {acento}…");
     let r = m.aplicar(&tema);
+    let mut espera = Ok(());
     if r.is_ok() {
         println!("Mirá la barra de tareas, el menú Inicio y la barra de título de una ventana.");
         println!("Enter para restaurar.");
-        stdin().read_line(&mut String::new())?;
+        espera = stdin().read_line(&mut String::new()).map(|_| ());
     }
     m.restaurar(&captura, &dir)?;
     r?;
+    espera?;
     println!("Restaurado. ¿Quedó todo como antes?");
     Ok(())
 }

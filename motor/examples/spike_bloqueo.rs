@@ -21,12 +21,14 @@ fn main() -> anyhow::Result<()> {
     let captura = m.capturar(&dir_cap)?;
     println!("Captura: {captura}");
     let r = m.aplicar(&tema);
+    let mut espera = Ok(());
     if r.is_ok() {
         println!("Aplicado. Apretá Win+L para ver la pantalla de bloqueo, volvé, y Enter para restaurar.");
-        stdin().read_line(&mut String::new())?;
+        espera = stdin().read_line(&mut String::new()).map(|_| ());
     }
     m.restaurar(&captura, &dir_cap)?;
     r?;
+    espera?;
     println!("Restaurado. Win+L de nuevo para confirmar.");
     Ok(())
 }

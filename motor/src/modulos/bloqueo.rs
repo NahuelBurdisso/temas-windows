@@ -4,7 +4,7 @@ use super::Modulo;
 use crate::registro::{self, RegValor};
 use crate::tema::Tema;
 use crate::win;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::path::Path;
 use windows::core::HSTRING;
@@ -33,10 +33,10 @@ pub fn poner_imagen(ruta: &Path) -> Result<()> {
 pub fn leer_imagen() -> Result<Vec<u8>> {
     win::iniciar_winrt();
     let stream = LockScreen::GetImageStream()?;
-    let tam = stream.Size()? as u32;
+    let tam = u32::try_from(stream.Size()?).context("la imagen de bloqueo es demasiado grande")?;
     let lector = DataReader::CreateDataReader(&stream.GetInputStreamAt(0)?)?;
-    lector.LoadAsync(tam)?.get()?;
-    let mut buf = vec![0u8; tam as usize];
+    let leidos = lector.LoadAsync(tam)?.get()?;
+    let mut buf = vec![0u8; leidos as usize];
     lector.ReadBytes(&mut buf)?;
     Ok(buf)
 }
@@ -53,7 +53,8 @@ pub fn extension_por_contenido(b: &[u8]) -> &'static str {
 
 fn spotlight_en(captura: &Value) -> bool {
     let clave = format!("{CDM}|RotatingLockScreenEnabled");
-    captura["registro"][clave] == json!({"tipo": "dword", "valor": 1})
+    let v = &captura["registro"][clave];
+    v["tipo"] == "dword" && v["valor"].as_u64().is_some_and(|n| n != 0)
 }
 
 pub struct Bloqueo;
@@ -65,13 +66,18 @@ impl Modulo for Bloqueo {
 
     fn capturar(&self, dir: &Path) -> Result<Value> {
         let registro = registro::capturar_valores(&CLAVES)?;
+        // Con Spotlight activo puede no haber imagen propia; sin Spotlight, no tenerla es un error.
+        let spot = spotlight_en(&json!({ "registro": &registro }));
         let archivo = match leer_imagen() {
             Ok(b) if !b.is_empty() => {
                 let nombre = format!("bloqueo.{}", extension_por_contenido(&b));
                 std::fs::write(dir.join(&nombre), &b)?;
                 Some(nombre)
             }
-            _ => None,
+            Ok(_) if spot => None,
+            Ok(_) => bail!("la imagen de bloqueo actual vino vacía"),
+            Err(_) if spot => None,
+            Err(e) => return Err(e).context("leer la imagen de bloqueo actual"),
         };
         Ok(json!({ "registro": registro, "archivo": archivo }))
     }
@@ -86,12 +92,20 @@ impl Modulo for Bloqueo {
     }
 
     fn restaurar(&self, captura: &Value, dir: &Path) -> Result<()> {
-        if !spotlight_en(captura) {
-            if let Some(n) = captura["archivo"].as_str() {
-                poner_imagen(&dir.join(n))?;
+        // Se intenta todo aunque algo falle; los errores se devuelven juntos.
+        let mut errores: Vec<String> = Vec::new();
+        if let Some(n) = captura["archivo"].as_str() {
+            if let Err(e) = poner_imagen(&dir.join(n)) {
+                errores.push(format!("restaurar imagen de bloqueo: {e:#}"));
             }
         }
-        registro::restaurar_valores(&captura["registro"])
+        if let Err(e) = registro::restaurar_valores(&captura["registro"]) {
+            errores.push(format!("restaurar registro de bloqueo: {e:#}"));
+        }
+        if !errores.is_empty() {
+            bail!("{}", errores.join("; "));
+        }
+        Ok(())
     }
 }
 
@@ -118,7 +132,12 @@ mod tests {
             serde_json::json!({ "registro": reg })
         };
         assert!(spotlight_en(&captura(1)));
+        assert!(spotlight_en(&captura(2)));
         assert!(!spotlight_en(&captura(0)));
+        let ausente = serde_json::json!({
+            "registro": { format!("{CDM}|RotatingLockScreenEnabled"): {"tipo": "ausente"} }
+        });
+        assert!(!spotlight_en(&ausente));
         assert!(!spotlight_en(&serde_json::json!({})));
     }
 }
