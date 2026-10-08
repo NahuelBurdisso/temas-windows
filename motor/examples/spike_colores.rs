@@ -19,12 +19,16 @@ fn main() -> anyhow::Result<()> {
 
     let m = Colores;
     let captura = m.capturar(&dir)?;
+    println!("Captura: {captura}");
     println!("Estado actual guardado. Aplicando {acento}…");
-    m.aplicar(&tema)?;
-    println!("Mirá la barra de tareas, el menú Inicio y la barra de título de una ventana.");
-    println!("Enter para restaurar.");
-    stdin().read_line(&mut String::new())?;
+    let r = m.aplicar(&tema);
+    if r.is_ok() {
+        println!("Mirá la barra de tareas, el menú Inicio y la barra de título de una ventana.");
+        println!("Enter para restaurar.");
+        stdin().read_line(&mut String::new())?;
+    }
     m.restaurar(&captura, &dir)?;
+    r?;
     println!("Restaurado. ¿Quedó todo como antes?");
     Ok(())
 }

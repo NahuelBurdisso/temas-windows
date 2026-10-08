@@ -48,12 +48,16 @@ pub fn valores_para(c: &ColoresConf) -> Result<Vec<(&'static str, &'static str, 
     ])
 }
 
-/// Apaga "elegir el acento automáticamente según el fondo", respetando el tipo de valor existente.
-fn apagar_autocolor() -> Result<()> {
-    let nuevo = match registro::leer(DESKTOP, "AutoColorization")? {
+/// Valor con el que se apaga "elegir el acento automáticamente", respetando el tipo existente.
+fn autocolor_apagado(actual: &RegValor) -> RegValor {
+    match actual {
         RegValor::Sz(_) => RegValor::Sz("0".into()),
         _ => RegValor::Dword(0),
-    };
+    }
+}
+
+fn apagar_autocolor() -> Result<()> {
+    let nuevo = autocolor_apagado(&registro::leer(DESKTOP, "AutoColorization")?);
     registro::escribir(DESKTOP, "AutoColorization", &nuevo)
 }
 
@@ -70,8 +74,9 @@ impl Modulo for Colores {
 
     fn aplicar(&self, tema: &Tema) -> Result<()> {
         let c = tema.conf.colores.as_ref().context("el tema no define colores")?;
+        let valores = valores_para(c)?;
         apagar_autocolor()?;
-        for (ruta, nombre, valor) in valores_para(c)? {
+        for (ruta, nombre, valor) in valores {
             registro::escribir(ruta, nombre, &valor)?;
         }
         win::avisar_cambio("ImmersiveColorSet");
@@ -108,6 +113,9 @@ mod tests {
         assert_eq!(valor(&vs, DWM, "AccentColor"), RegValor::Dword(0xFF27_A2C9));
         assert_eq!(valor(&vs, DWM, "ColorizationColor"), RegValor::Dword(0xC4C9_A227));
         assert_eq!(valor(&vs, ACCENT, "AccentColorMenu"), RegValor::Dword(0xFF27_A2C9));
+        let esperado = Rgb::desde_hex("#C9A227").unwrap().con_luz(-0.20).abgr();
+        assert_eq!(valor(&vs, ACCENT, "StartColorMenu"), RegValor::Dword(esperado));
+        assert_eq!(valor(&vs, PERSONALIZE, "EnableTransparency"), RegValor::Dword(1));
         match valor(&vs, ACCENT, "AccentPalette") {
             RegValor::Binario(b) => assert_eq!(b.len(), 32),
             otro => panic!("AccentPalette debería ser binario: {otro:?}"),
@@ -118,7 +126,25 @@ mod tests {
     fn claro_ignora_la_barra() {
         let vs = valores_para(&conf(Modo::Claro, true)).unwrap();
         assert_eq!(valor(&vs, PERSONALIZE, "AppsUseLightTheme"), RegValor::Dword(1));
+        assert_eq!(valor(&vs, PERSONALIZE, "SystemUsesLightTheme"), RegValor::Dword(1));
         assert_eq!(valor(&vs, PERSONALIZE, "ColorPrevalence"), RegValor::Dword(0));
+        assert_eq!(valor(&vs, DWM, "ColorPrevalence"), RegValor::Dword(0));
+    }
+
+    #[test]
+    fn sin_transparencia() {
+        let mut c = conf(Modo::Oscuro, false);
+        c.transparencia = false;
+        let vs = valores_para(&c).unwrap();
+        assert_eq!(valor(&vs, PERSONALIZE, "EnableTransparency"), RegValor::Dword(0));
+        assert_eq!(valor(&vs, PERSONALIZE, "ColorPrevalence"), RegValor::Dword(0));
+    }
+
+    #[test]
+    fn autocolor_respeta_el_tipo() {
+        assert_eq!(autocolor_apagado(&RegValor::Sz("1".into())), RegValor::Sz("0".into()));
+        assert_eq!(autocolor_apagado(&RegValor::Dword(1)), RegValor::Dword(0));
+        assert_eq!(autocolor_apagado(&RegValor::Ausente), RegValor::Dword(0));
     }
 
     #[test]
