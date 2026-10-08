@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -41,21 +42,26 @@ impl Rutas {
 }
 
 pub(crate) fn leer_json<T: DeserializeOwned + Default>(ruta: &Path) -> Result<T> {
-    if !ruta.exists() {
-        return Ok(T::default());
-    }
-    let texto = fs::read_to_string(ruta).with_context(|| format!("leer {}", ruta.display()))?;
+    let texto = match fs::read_to_string(ruta) {
+        Ok(t) => t,
+        // Sólo "no existe" significa "usar el valor por defecto"; cualquier otro error se informa.
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(T::default()),
+        Err(e) => return Err(e).with_context(|| format!("leer {}", ruta.display())),
+    };
     serde_json::from_str(texto.trim_start_matches('\u{feff}'))
         .with_context(|| format!("{} mal formado", ruta.display()))
 }
 
-/// Escribe en un temporal y renombra, para no dejar archivos a medias.
+/// Escribe en un temporal (sincronizado a disco) y renombra, para no dejar archivos a medias.
 pub(crate) fn escribir_json<T: Serialize>(ruta: &Path, v: &T) -> Result<()> {
     if let Some(p) = ruta.parent() {
         fs::create_dir_all(p)?;
     }
     let tmp = ruta.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_string_pretty(v)?)?;
+    let mut f = fs::File::create(&tmp).with_context(|| format!("crear {}", tmp.display()))?;
+    f.write_all(serde_json::to_string_pretty(v)?.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
     fs::rename(&tmp, ruta).with_context(|| format!("guardar {}", ruta.display()))?;
     Ok(())
 }
@@ -119,25 +125,47 @@ impl Original {
 }
 
 /// Pasa las capturas de `ids` (y sus carpetas) de `original` a `original.prev`.
-pub fn archivar_original(r: &Rutas, ids: &[String]) -> Result<()> {
+///
+/// El punto de confirmación es `original.json`: se escribe primero sin los ids archivados. Después se
+/// copian las capturas a `original.prev.json` y por último se mueven las carpetas, sin abortar ante
+/// errores: los problemas de carpetas se devuelven como avisos.
+pub fn archivar_original(r: &Rutas, ids: &[String]) -> Result<Vec<String>> {
     let mut orig = Original::cargar(r)?;
-    let mut prev: Original = leer_json(&r.original_prev())?;
+    let mut archivadas = vec![];
     for id in ids {
         if let Some(v) = orig.0.remove(id) {
-            prev.0.insert(id.clone(), v);
+            archivadas.push((id.clone(), v));
         }
+    }
+    orig.guardar(r)?;
+
+    let mut prev: Original = leer_json(&r.original_prev())?;
+    for (id, v) in archivadas {
+        prev.0.insert(id, v);
+    }
+    escribir_json(&r.original_prev(), &prev)?;
+
+    let mut avisos = vec![];
+    for id in ids {
         let src = r.dir_original(id);
         let dst = r.dir_original_prev(id);
         if dst.exists() {
-            fs::remove_dir_all(&dst)?;
+            if let Err(e) = fs::remove_dir_all(&dst) {
+                avisos.push(format!("no se pudo borrar {}: {e}", dst.display()));
+                continue;
+            }
         }
         if src.exists() {
-            fs::create_dir_all(dst.parent().expect("dir_original_prev tiene padre"))?;
-            fs::rename(&src, &dst)?;
+            let movido = match dst.parent() {
+                Some(p) => fs::create_dir_all(p).and_then(|_| fs::rename(&src, &dst)),
+                None => fs::rename(&src, &dst),
+            };
+            if let Err(e) = movido {
+                avisos.push(format!("no se pudo archivar {}: {e}", src.display()));
+            }
         }
     }
-    escribir_json(&r.original_prev(), &prev)?;
-    orig.guardar(r)
+    Ok(avisos)
 }
 
 #[cfg(test)]
@@ -191,7 +219,8 @@ mod tests {
         std::fs::create_dir_all(r.dir_original_prev("fondos")).unwrap();
         std::fs::write(r.dir_original_prev("fondos").join("viejo.jpg"), b"viejo").unwrap();
 
-        archivar_original(&r, &["fondos".to_string()]).unwrap();
+        let avisos = archivar_original(&r, &["fondos".to_string()]).unwrap();
+        assert!(avisos.is_empty(), "{avisos:?}");
 
         let o = Original::cargar(&r).unwrap();
         assert!(o.get("fondos").is_none());
@@ -201,6 +230,27 @@ mod tests {
         assert!(!r.dir_original("fondos").exists());
         assert!(r.dir_original_prev("fondos").join("fondo.jpg").exists());
         assert!(!r.dir_original_prev("fondos").join("viejo.jpg").exists());
+    }
+
+    #[test]
+    fn archivar_sin_carpeta_de_origen_no_avisa_nada() {
+        let (_t, r) = rutas();
+        let mut o = Original::default();
+        o.poner("colores", json!({"a": 1}));
+        o.guardar(&r).unwrap();
+        let avisos = archivar_original(&r, &["colores".to_string()]).unwrap();
+        assert!(avisos.is_empty(), "{avisos:?}");
+        assert!(Original::cargar(&r).unwrap().get("colores").is_none());
+        let prev: Original = leer_json(&r.original_prev()).unwrap();
+        assert!(prev.get("colores").is_some());
+    }
+
+    #[test]
+    fn error_de_io_que_no_es_not_found_se_propaga() {
+        let (_t, r) = rutas();
+        // Un directorio donde se espera el archivo: leerlo da un error que no es NotFound.
+        std::fs::create_dir_all(r.estado()).unwrap();
+        assert!(Estado::cargar(&r).is_err());
     }
 
     #[test]

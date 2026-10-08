@@ -4,7 +4,7 @@ use crate::estado::{archivar_original, Estado, Original, Rutas};
 use crate::modulos::Modulo;
 use crate::tema::Tema;
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Informe {
@@ -51,6 +51,7 @@ impl Motor {
         let mut inf = Informe { advertencias: tema.advertencias.clone(), ..Default::default() };
         let mut original = Original::cargar(&self.rutas)?;
         let mut estado = Estado::cargar(&self.rutas)?;
+        let tocados_antes = estado.tocados.clone();
 
         // 1. Qué se aplica, capturando el original de lo que todavía no lo tiene.
         let mut nuevos: Vec<&dyn Modulo> = vec![];
@@ -61,9 +62,8 @@ impl Motor {
             }
             if original.get(id).is_none() {
                 let dir = self.dir(id);
-                let captura = std::fs::create_dir_all(&dir)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|_| m.capturar(&dir));
+                // Cualquier resto de una captura anterior se descarta: la carpeta arranca limpia.
+                let captura = Self::carpeta_limpia(&dir).and_then(|_| m.capturar(&dir));
                 match captura {
                     Ok(v) => {
                         original.poner(id, v);
@@ -79,14 +79,30 @@ impl Motor {
         }
         let ids_nuevos: Vec<String> = nuevos.iter().map(|m| m.id().to_string()).collect();
 
+        // Se anota la intención antes de tocar Windows: si la app se cae a mitad, el próximo
+        // cambio sabe que esos módulos pudieron quedar modificados.
+        estado.tocados = tocados_antes.clone();
+        for id in &ids_nuevos {
+            if !estado.tocados.contains(id) {
+                estado.tocados.push(id.clone());
+            }
+        }
+        estado.guardar(&self.rutas)?;
+
         // 2. Lo que el tema anterior tocó y este no aplica vuelve al original.
         let mut pendientes = vec![];
-        for id in estado.tocados.iter().filter(|id| !ids_nuevos.contains(id)) {
-            if let (Some(m), Some(c)) = (self.modulo(id), original.get(id)) {
-                if let Err(e) = m.restaurar(c, &self.dir(id)) {
-                    inf.errores.push((id.clone(), format!("no se pudo restaurar: {e:#}")));
-                    pendientes.push(id.clone());
-                }
+        for id in tocados_antes.iter().filter(|id| !ids_nuevos.contains(id)) {
+            let Some(m) = self.modulo(id) else {
+                inf.advertencias.push(format!("{id}: figura como modificado pero no hay un módulo registrado; se descarta"));
+                continue;
+            };
+            let Some(c) = original.get(id) else {
+                inf.advertencias.push(format!("{id}: figura como modificado pero no hay estado original guardado; se descarta"));
+                continue;
+            };
+            if let Err(e) = m.restaurar(c, &self.dir(id)) {
+                inf.errores.push((id.clone(), format!("no se pudo restaurar: {e:#}")));
+                pendientes.push(id.clone());
             }
         }
 
@@ -105,6 +121,14 @@ impl Motor {
         Ok(inf)
     }
 
+    fn carpeta_limpia(dir: &Path) -> Result<()> {
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)?;
+        }
+        std::fs::create_dir_all(dir)?;
+        Ok(())
+    }
+
     pub fn restaurar_original(&self) -> Result<Informe> {
         let original = Original::cargar(&self.rutas)?;
         let mut inf = Informe::default();
@@ -115,8 +139,15 @@ impl Motor {
                 Err(e) => inf.errores.push((id.clone(), format!("{e:#}"))),
             }
         }
-        archivar_original(&self.rutas, &inf.ok)?;
-        Estado::default().guardar(&self.rutas)?;
+        let avisos = archivar_original(&self.rutas, &inf.ok)?;
+        inf.advertencias.extend(avisos);
+        // Lo que no se pudo restaurar sigue rastreado, para reintentarlo en la próxima aplicación.
+        let estado = Estado {
+            tema_activo: None,
+            tocados: inf.errores.iter().map(|(id, _)| id.clone()).collect(),
+            fondos_pausados: false,
+        };
+        estado.guardar(&self.rutas)?;
         Ok(inf)
     }
 }
@@ -127,6 +158,7 @@ mod tests {
     use crate::estado::{leer_json, Estado, Original};
     use serde_json::{json, Value};
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     type Log = Arc<Mutex<Vec<String>>>;
@@ -136,12 +168,38 @@ mod tests {
         capturar: bool,
         aplicar: bool,
         restaurar: bool,
+        /// Si es > 0, `restaurar` falla sólo las primeras N veces que lo llaman.
+        restaurar_veces: usize,
     }
 
     struct Falso {
         id: &'static str,
         log: Log,
         fallas: Fallas,
+        llamadas_restaurar: AtomicUsize,
+    }
+
+    /// Módulo "colores" que, al aplicar, verifica que la intención ya esté guardada en estado.json.
+    struct Espia {
+        rutas: Rutas,
+        vio_la_intencion: Arc<AtomicBool>,
+    }
+
+    impl Modulo for Espia {
+        fn id(&self) -> &'static str {
+            "colores"
+        }
+        fn capturar(&self, _dir: &Path) -> Result<Value> {
+            Ok(json!({ "de": "colores" }))
+        }
+        fn aplicar(&self, _tema: &Tema) -> Result<()> {
+            let e = Estado::cargar(&self.rutas).unwrap();
+            self.vio_la_intencion.store(e.tocados.contains(&"colores".to_string()), Ordering::SeqCst);
+            Ok(())
+        }
+        fn restaurar(&self, _captura: &Value, _dir: &Path) -> Result<()> {
+            Ok(())
+        }
     }
 
     impl Modulo for Falso {
@@ -162,7 +220,8 @@ mod tests {
         fn restaurar(&self, captura: &Value, _dir: &Path) -> Result<()> {
             assert_eq!(captura, &json!({ "de": self.id }));
             self.log.lock().unwrap().push(format!("restaurar:{}", self.id));
-            if self.fallas.restaurar { anyhow::bail!("falla restaurar") }
+            let n = self.llamadas_restaurar.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fallas.restaurar || n <= self.fallas.restaurar_veces { anyhow::bail!("falla restaurar") }
             Ok(())
         }
     }
@@ -180,7 +239,7 @@ mod tests {
         let falla = |id| fallas.iter().find(|(i, _)| *i == id).map(|(_, f)| *f).unwrap_or_default();
         let modulos: Vec<Box<dyn Modulo>> = ["colores", "terminal", "bloqueo"]
             .into_iter()
-            .map(|id| Box::new(Falso { id, log: log.clone(), fallas: falla(id) }) as Box<dyn Modulo>)
+            .map(|id| Box::new(Falso { id, log: log.clone(), fallas: falla(id), llamadas_restaurar: AtomicUsize::new(0) }) as Box<dyn Modulo>)
             .collect();
         let motor = Motor::nuevo(Rutas::nuevo(tmp.path().join("app")), modulos);
         Banco { temas: tmp.path().join("temas"), _tmp: tmp, log, motor }
@@ -320,6 +379,79 @@ mod tests {
         assert_eq!(inf.ok, ["colores"]);
         assert!(b.original().get("terminal").is_some());
         assert!(b.original().get("colores").is_none());
+        assert_eq!(b.estado().tocados, ["terminal"], "lo que falló sigue rastreado");
+        assert_eq!(b.estado().tema_activo, None);
+    }
+
+    #[test]
+    fn restaurar_original_fallido_se_reintenta_en_la_proxima_aplicacion() {
+        let b = banco(&[("terminal", Fallas { restaurar: true, ..Default::default() })]);
+        b.motor.aplicar(&b.tema("a", &["colores", "terminal"]), &[]).unwrap();
+        b.motor.restaurar_original().unwrap();
+        b.log();
+        b.motor.aplicar(&b.tema("b", &["colores"]), &[]).unwrap();
+        assert!(b.log().contains(&"restaurar:terminal".to_string()));
+    }
+
+    #[test]
+    fn restaurar_pendiente_que_falla_una_vez_se_resuelve_en_la_siguiente() {
+        let b = banco(&[("terminal", Fallas { restaurar_veces: 1, ..Default::default() })]);
+        let tb = b.tema("b", &["colores"]);
+        b.motor.aplicar(&b.tema("a", &["colores", "terminal"]), &[]).unwrap();
+        let inf = b.motor.aplicar(&tb, &[]).unwrap();
+        assert_eq!(inf.errores[0].0, "terminal");
+        assert_eq!(b.estado().tocados, ["colores", "terminal"]);
+        b.log();
+        let inf = b.motor.aplicar(&tb, &[]).unwrap();
+        assert!(inf.errores.is_empty(), "{:?}", inf.errores);
+        assert_eq!(b.log(), ["restaurar:terminal", "aplicar:colores:b"]);
+        assert_eq!(b.estado().tocados, ["colores"]);
+    }
+
+    #[test]
+    fn la_intencion_se_guarda_antes_de_aplicar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rutas = Rutas::nuevo(tmp.path().join("app"));
+        let visto = Arc::new(AtomicBool::new(false));
+        let espia = Espia { rutas: rutas.clone(), vio_la_intencion: visto.clone() };
+        let motor = Motor::nuevo(rutas, vec![Box::new(espia)]);
+        let dir = tmp.path().join("temas").join("a");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tema.json"), json!({"nombre": "a", "colores": {"acento": "#C9A227", "modo": "oscuro"}}).to_string()).unwrap();
+        motor.aplicar(&Tema::cargar(&dir).unwrap(), &[]).unwrap();
+        assert!(visto.load(Ordering::SeqCst), "estado.json ya tenía el módulo en tocados durante aplicar");
+    }
+
+    #[test]
+    fn fondos_pausados_sobrevive_a_aplicar() {
+        let b = banco(&[]);
+        Estado { fondos_pausados: true, ..Default::default() }.guardar(&b.motor.rutas).unwrap();
+        b.motor.aplicar(&b.tema("a", &["colores"]), &[]).unwrap();
+        assert!(b.estado().fondos_pausados);
+    }
+
+    #[test]
+    fn tocado_sin_modulo_o_sin_captura_avisa_y_se_descarta() {
+        let b = banco(&[]);
+        Estado { tema_activo: Some("x".into()), tocados: vec!["fantasma".into(), "terminal".into()], fondos_pausados: false }
+            .guardar(&b.motor.rutas)
+            .unwrap();
+        let inf = b.motor.aplicar(&b.tema("a", &["colores"]), &[]).unwrap();
+        assert_eq!(inf.advertencias.len(), 2, "{:?}", inf.advertencias);
+        assert!(inf.advertencias.iter().any(|a| a.contains("fantasma")));
+        assert!(inf.advertencias.iter().any(|a| a.contains("terminal")));
+        assert_eq!(b.estado().tocados, ["colores"]);
+    }
+
+    #[test]
+    fn captura_limpia_la_carpeta_vieja_del_modulo() {
+        let b = banco(&[]);
+        let viejo = b.motor.rutas.dir_original("colores").join("resto.bin");
+        std::fs::create_dir_all(viejo.parent().unwrap()).unwrap();
+        std::fs::write(&viejo, b"viejo").unwrap();
+        b.motor.aplicar(&b.tema("a", &["colores"]), &[]).unwrap();
+        assert!(!viejo.exists());
+        assert!(b.motor.rutas.dir_original("colores").is_dir());
     }
 
     #[test]
