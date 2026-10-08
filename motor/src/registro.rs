@@ -13,6 +13,8 @@ pub enum RegValor {
     Ausente,
     Dword(u32),
     Sz(String),
+    /// `REG_EXPAND_SZ`: se guarda el texto sin expandir (`%SystemRoot%`...).
+    ExpandSz(String),
     Binario(Vec<u8>),
 }
 
@@ -37,6 +39,7 @@ pub fn leer(ruta: &str, nombre: &str) -> Result<RegValor> {
             RegValor::Dword(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
         }
         REG_SZ => RegValor::Sz(clave.get_value::<String, _>(nombre)?),
+        REG_EXPAND_SZ => RegValor::ExpandSz(clave.get_value::<String, _>(nombre)?),
         REG_BINARY => RegValor::Binario(bytes),
         otro => bail!(r"HKCU\{ruta}\{nombre}: tipo de registro no soportado ({otro:?})"),
     })
@@ -44,14 +47,16 @@ pub fn leer(ruta: &str, nombre: &str) -> Result<RegValor> {
 
 pub fn escribir(ruta: &str, nombre: &str, valor: &RegValor) -> Result<()> {
     if let RegValor::Ausente = valor {
-        if let Ok(k) = hkcu().open_subkey_with_flags(ruta, KEY_SET_VALUE) {
-            match k.delete_value(nombre) {
-                Ok(()) => {}
-                Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(e) => return Err(e).with_context(|| format!(r"borrar HKCU\{ruta}\{nombre}")),
-            }
-        }
-        return Ok(());
+        let k = match hkcu().open_subkey_with_flags(ruta, KEY_SET_VALUE) {
+            Ok(k) => k,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).with_context(|| format!(r"abrir HKCU\{ruta} para borrar")),
+        };
+        return match k.delete_value(nombre) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!(r"borrar HKCU\{ruta}\{nombre}")),
+        };
     }
     let (clave, _) = hkcu()
         .create_subkey(ruta)
@@ -59,10 +64,18 @@ pub fn escribir(ruta: &str, nombre: &str, valor: &RegValor) -> Result<()> {
     match valor {
         RegValor::Dword(n) => clave.set_value(nombre, n),
         RegValor::Sz(s) => clave.set_value(nombre, s),
-        RegValor::Binario(b) => clave.set_raw_value(
-            nombre,
-            &RegValue { bytes: b.clone().into(), vtype: REG_BINARY },
-        ),
+        RegValor::ExpandSz(s) => {
+            // UTF-16LE con terminador nulo, conservando el tipo REG_EXPAND_SZ.
+            let bytes: Vec<u8> = s
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .flat_map(|u| u.to_le_bytes())
+                .collect();
+            clave.set_raw_value(nombre, &RegValue { bytes, vtype: REG_EXPAND_SZ })
+        }
+        RegValor::Binario(b) => {
+            clave.set_raw_value(nombre, &RegValue { bytes: b.clone(), vtype: REG_BINARY })
+        }
         RegValor::Ausente => unreachable!(),
     }
     .with_context(|| format!(r"escribir HKCU\{ruta}\{nombre}"))
@@ -122,6 +135,7 @@ mod tests {
             ("d", RegValor::Dword(0xFF27_A2C9)),
             ("s", RegValor::Sz("10".into())),
             ("b", RegValor::Binario(vec![1, 2, 3, 0, 255])),
+            ("e", RegValor::ExpandSz(r"%SystemRoot%\System32\imageres.dll,-109".into())),
         ] {
             escribir(&k.0, nombre, &v).unwrap();
             assert_eq!(leer(&k.0, nombre).unwrap(), v);
