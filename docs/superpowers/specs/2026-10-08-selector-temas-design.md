@@ -212,6 +212,8 @@ Cada etapa termina en algo usable.
    migración desde `rotar.ps1`; temas Star Wars y Game of Thrones.
    Resultado del spike de colores (2026-10-08): con `#C9A227`, modo oscuro y acento en barra, la barra de tareas,
    el menú Inicio y las barras de título cambian en vivo sin cerrar sesión; al restaurar vuelve todo. Sin ajustes.
+   Resultado del spike de bloqueo (2026-10-08): `LockScreen.SetImageFileAsync` funciona sin admin desde la app sin
+   empaquetar; Win+L muestra la imagen del tema y al restaurar vuelve la pantalla de bloqueo anterior. Sin ajustes.
 2. **Galería + instalador**: ventana, detalle, casillas por módulo, "Nuevo tema", Ajustes, autostart, instalador NSIS en `D:\Programas\`.
 3. **Sonidos + intro.**
 4. **Íconos + protector de pantalla** (presentación y crawl).
