@@ -36,6 +36,9 @@ pub fn leer_imagen() -> Result<Vec<u8>> {
     let tam = u32::try_from(stream.Size()?).context("la imagen de bloqueo es demasiado grande")?;
     let lector = DataReader::CreateDataReader(&stream.GetInputStreamAt(0)?)?;
     let leidos = lector.LoadAsync(tam)?.get()?;
+    if leidos != tam {
+        bail!("lectura incompleta de la imagen de bloqueo: {leidos} de {tam} bytes");
+    }
     let mut buf = vec![0u8; leidos as usize];
     lector.ReadBytes(&mut buf)?;
     Ok(buf)
