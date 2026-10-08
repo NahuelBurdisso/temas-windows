@@ -2,6 +2,7 @@
 
 pub mod bloqueo;
 pub mod colores;
+pub mod fondos;
 
 use crate::tema::Tema;
 use anyhow::Result;
