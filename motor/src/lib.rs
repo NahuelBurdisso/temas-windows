@@ -4,5 +4,6 @@ pub mod estado;
 pub mod modulos;
 pub mod nucleo;
 pub mod registro;
+pub mod rotador;
 pub mod tema;
 pub mod win;
