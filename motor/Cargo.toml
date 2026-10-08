@@ -1,0 +1,27 @@
+[package]
+name = "motor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+winreg = "0.55"
+jsonc-parser = { version = "0.26", features = ["cst", "serde"] }
+rand = "0.8"
+
+[dependencies.windows]
+version = "0.61"
+features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_WinRT",
+  "Foundation",
+  "Storage",
+  "Storage_Streams",
+  "System_UserProfile",
+]
+
+[dev-dependencies]
+tempfile = "3"
