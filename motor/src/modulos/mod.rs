@@ -1,5 +1,7 @@
 //! Cada parte de Windows que un tema puede cambiar es un módulo.
 
+pub mod colores;
+
 use crate::tema::Tema;
 use anyhow::Result;
 use serde_json::Value;
