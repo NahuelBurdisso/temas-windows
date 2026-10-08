@@ -28,7 +28,8 @@ pub fn avisar_cambio(area: &str) {
 }
 
 pub fn poner_fondo(ruta: &Path) -> Result<()> {
-    let h = HSTRING::from(ruta.to_string_lossy().as_ref());
+    // SPI_SETDESKWALLPAPER exige una ruta absoluta.
+    let h = HSTRING::from(std::path::absolute(ruta)?.as_path());
     unsafe {
         SystemParametersInfoW(
             SPI_SETDESKWALLPAPER,

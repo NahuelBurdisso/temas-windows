@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub const EXTENSIONES_IMAGEN: [&str; 4] = ["jpg", "jpeg", "png", "bmp"];
 
@@ -28,6 +28,7 @@ fn si() -> bool {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct ColoresConf {
     pub acento: String,
     pub modo: Modo,
@@ -73,6 +74,7 @@ fn veinte() -> u64 {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 pub struct FondosConf {
     #[serde(default = "veinte")]
     pub intervalo_seg: u64,
@@ -83,6 +85,7 @@ pub struct FondosConf {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalConf {
     pub fondo: String,
     pub texto: String,
@@ -92,6 +95,7 @@ pub struct TerminalConf {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TemaJson {
     pub nombre: String,
     pub colores: Option<ColoresConf>,
@@ -152,7 +156,17 @@ impl Tema {
             }
         }
         if let Some(b) = &self.conf.bloqueo {
-            if !self.dir.join(b).is_file() {
+            let ruta = Path::new(b);
+            if ruta.is_absolute()
+                || ruta.has_root()
+                || ruta.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+            {
+                bail!("bloqueo debe ser una ruta relativa dentro del tema (es {b:?})");
+            }
+            if !es_imagen(ruta) {
+                bail!("bloqueo debe ser una imagen ({}), no {b:?}", EXTENSIONES_IMAGEN.join("/"));
+            }
+            if !self.dir.join(ruta).is_file() {
                 bail!("no existe la imagen de bloqueo {b}");
             }
         }
@@ -188,6 +202,14 @@ impl Tema {
     }
 }
 
+/// ¿La extensión es de una imagen admitida? (sin distinguir mayúsculas)
+fn es_imagen(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| EXTENSIONES_IMAGEN.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 /// Imágenes de una carpeta (no recursivo), ordenadas por nombre. Carpeta inexistente → vacío.
 pub fn listar_imagenes(dir: &Path) -> Result<Vec<PathBuf>> {
     if !dir.is_dir() {
@@ -195,13 +217,7 @@ pub fn listar_imagenes(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     let mut v: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            p.is_file()
-                && p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| EXTENSIONES_IMAGEN.contains(&e.to_ascii_lowercase().as_str()))
-                    .unwrap_or(false)
-        })
+        .filter(|p| p.is_file() && es_imagen(p))
         .collect();
     v.sort();
     Ok(v)
@@ -286,13 +302,54 @@ mod tests {
             json!({"nombre": "  "}),
             json!({"nombre": "X", "colores": {"acento": "amarillo", "modo": "oscuro"}}),
             json!({"nombre": "X", "colores": {"acento": "#FFFFFF", "modo": "gris"}}),
-            json!({"nombre": "X", "fondos": {"intervaloSeg": 3}}),
             json!({"nombre": "X", "fondos": {}}),
             json!({"nombre": "X", "bloqueo": "no-existe.jpg"}),
             json!({"nombre": "X", "terminal": {"fondo": "#000000", "texto": "#FFFFFF", "cursor": "#FFFFFF", "ansi": {"rosa": "#FF00FF"}}}),
+            json!({"nombre": "X", "terminal": {"fondo": "#000000", "texto": "#FFFFFF", "cursor": "rojo"}}),
         ];
         for (i, c) in casos.into_iter().enumerate() {
             let dir = crear(t.path(), &format!("caso{i}"), c.clone(), &[]);
+            assert!(Tema::cargar(&dir).is_err(), "el caso {i} debería fallar: {c}");
+        }
+    }
+
+    #[test]
+    fn intervalo_minimo_de_fondos() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = crear(t.path(), "corto", json!({"nombre": "X", "fondos": {"intervaloSeg": 3}}), &["a.jpg"]);
+        let err = format!("{:#}", Tema::cargar(&dir).unwrap_err());
+        assert!(err.contains("intervaloSeg"), "mensaje inesperado: {err}");
+        let dir = crear(t.path(), "justo", json!({"nombre": "X", "fondos": {"intervaloSeg": 5}}), &["a.jpg"]);
+        assert_eq!(Tema::cargar(&dir).unwrap().conf.fondos.unwrap().intervalo_seg, 5);
+    }
+
+    #[test]
+    fn bloqueo_debe_ser_imagen_relativa_dentro_del_tema() {
+        let t = tempfile::tempdir().unwrap();
+        // Archivo real fuera de la carpeta del tema, para que falle por la ruta y no por inexistente.
+        fs::write(t.path().join("x.jpg"), b"x").unwrap();
+        let absoluta = t.path().join("x.jpg").to_string_lossy().into_owned();
+        let casos = [absoluta.as_str(), "../x.jpg", "fondos/../../x.jpg", "tema.json"];
+        for (i, b) in casos.into_iter().enumerate() {
+            let dir = crear(&t.path().join("temas"), &format!("b{i}"), json!({"nombre": "X", "bloqueo": b}), &[]);
+            fs::write(dir.parent().unwrap().join("x.jpg"), b"x").unwrap();
+            assert!(Tema::cargar(&dir).is_err(), "bloqueo {b:?} debería fallar");
+        }
+        let dir = crear(&t.path().join("temas"), "ok", json!({"nombre": "X", "bloqueo": "fondos/A.JPG"}), &["A.JPG"]);
+        assert!(Tema::cargar(&dir).is_ok());
+    }
+
+    #[test]
+    fn campos_desconocidos_son_error() {
+        let t = tempfile::tempdir().unwrap();
+        let casos = [
+            json!({"nombre": "X", "fondos": {"intervaloseg": 30}}),
+            json!({"nombre": "X", "colores": {"acento": "#FFFFFF", "modo": "oscuro", "acentoenbarra": true}}),
+            json!({"nombre": "X", "terminal": {"fondo": "#000000", "texto": "#FFFFFF", "cursor": "#FFFFFF", "cursro": "#FFFFFF"}}),
+            json!({"nombre": "X", "colorez": {}}),
+        ];
+        for (i, c) in casos.into_iter().enumerate() {
+            let dir = crear(t.path(), &format!("typo{i}"), c.clone(), &["a.jpg"]);
             assert!(Tema::cargar(&dir).is_err(), "el caso {i} debería fallar: {c}");
         }
     }
