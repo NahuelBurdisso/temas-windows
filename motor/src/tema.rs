@@ -151,6 +151,9 @@ impl Tema {
             if f.intervalo_seg < 5 {
                 bail!("fondos.intervaloSeg debe ser ≥ 5 (es {})", f.intervalo_seg);
             }
+            if f.intervalo_seg > 86_400 {
+                bail!("fondos.intervaloSeg debe ser ≤ 86400 (es {})", f.intervalo_seg);
+            }
             if listar_imagenes(&self.dir.join("fondos"))?.is_empty() {
                 bail!(r"la carpeta fondos\ no tiene imágenes");
             }
@@ -311,6 +314,18 @@ mod tests {
             let dir = crear(t.path(), &format!("caso{i}"), c.clone(), &[]);
             assert!(Tema::cargar(&dir).is_err(), "el caso {i} debería fallar: {c}");
         }
+    }
+
+    #[test]
+    fn intervalo_maximo_de_fondos() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = crear(t.path(), "largo", json!({"nombre": "X", "fondos": {"intervaloSeg": 86401}}), &["a.jpg"]);
+        let err = format!("{:#}", Tema::cargar(&dir).unwrap_err());
+        assert!(err.contains("intervaloSeg"), "mensaje inesperado: {err}");
+        let dir = crear(t.path(), "dia", json!({"nombre": "X", "fondos": {"intervaloSeg": 86400}}), &["a.jpg"]);
+        assert_eq!(Tema::cargar(&dir).unwrap().conf.fondos.unwrap().intervalo_seg, 86400);
+        let dir = crear(t.path(), "enorme", json!({"nombre": "X", "fondos": {"intervaloSeg": u64::MAX}}), &["a.jpg"]);
+        assert!(Tema::cargar(&dir).is_err());
     }
 
     #[test]

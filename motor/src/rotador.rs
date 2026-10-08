@@ -2,11 +2,15 @@
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 type Poner = dyn Fn(&Path) -> Result<()> + Send + Sync;
+type Compartido = Arc<(Mutex<Estado>, Condvar)>;
+
+/// Tope de espera si el intervalo es tan grande que `Instant` se desborda.
+const UN_DIA: Duration = Duration::from_secs(86_400);
 
 #[derive(Default)]
 struct Estado {
@@ -19,14 +23,32 @@ struct Estado {
     generacion: u64,
 }
 
+/// Rota los fondos en un hilo propio.
+///
+/// Orden de locks: siempre `poniendo` primero y después el mutex de estado, nunca al revés.
+/// `poniendo` se sostiene únicamente durante la llamada a `poner` (y su chequeo previo de
+/// generación), jamás mientras se espera en la condvar. Por eso `detener`/`pausar` pueden
+/// esperar a que termine un `poner` en curso. Consecuencia: `poner` no debe llamar a
+/// `detener`/`pausar` del mismo rotador (se bloquearía a sí mismo).
 pub struct Rotador {
-    inner: Arc<(Mutex<Estado>, Condvar)>,
+    inner: Compartido,
     poner: Arc<Poner>,
+    /// Se sostiene mientras corre `poner`.
+    poniendo: Arc<Mutex<()>>,
+}
+
+fn tomar<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn limite_desde(intervalo: Duration) -> Instant {
+    let ahora = Instant::now();
+    ahora.checked_add(intervalo).unwrap_or_else(|| ahora + UN_DIA)
 }
 
 impl Rotador {
     pub fn nuevo(poner: impl Fn(&Path) -> Result<()> + Send + Sync + 'static) -> Rotador {
-        Rotador { inner: Default::default(), poner: Arc::new(poner) }
+        Rotador { inner: Default::default(), poner: Arc::new(poner), poniendo: Default::default() }
     }
 
     pub fn iniciar(&self, lista: Vec<PathBuf>, intervalo: Duration) {
@@ -48,23 +70,29 @@ impl Rotador {
         }
         let inner = self.inner.clone();
         let poner = self.poner.clone();
-        thread::spawn(move || bucle(inner, poner, gen));
+        let poniendo = self.poniendo.clone();
+        // El hilo nuevo espera en `poniendo` a que termine el `poner` del viejo: no se pisan.
+        thread::spawn(move || bucle(inner, poner, poniendo, gen));
     }
 
     pub fn siguiente(&self) {
         self.cambiar(|e| e.saltar = true);
     }
+    /// Al volver, ningún `poner` está en curso ni va a empezar hasta `reanudar`.
     pub fn pausar(&self) {
         self.cambiar(|e| e.pausado = true);
+        self.esperar_poner();
     }
     pub fn reanudar(&self) {
         self.cambiar(|e| e.pausado = false);
     }
+    /// Al volver, ningún `poner` está en curso ni va a empezar.
     pub fn detener(&self) {
         self.cambiar(|e| {
             e.generacion += 1;
             e.lista.clear();
         });
+        self.esperar_poner();
     }
     pub fn activo(&self) -> bool {
         !self.inner.0.lock().unwrap().lista.is_empty()
@@ -78,34 +106,58 @@ impl Rotador {
         f(&mut m.lock().unwrap());
         cv.notify_all();
     }
+
+    /// Espera a que termine el `poner` en curso (si hay). El hilo ya no empieza otro:
+    /// lo impide el estado que `cambiar` dejó antes de llamar acá.
+    fn esperar_poner(&self) {
+        drop(tomar(&self.poniendo));
+    }
 }
 
-fn bucle(inner: Arc<(Mutex<Estado>, Condvar)>, poner: Arc<Poner>, gen: u64) {
+fn bucle(inner: Compartido, poner: Arc<Poner>, poniendo: Arc<Mutex<()>>, gen: u64) {
     let (m, cv) = &*inner;
+    // Tras `siguiente`, se pone la imagen aunque esté en pausa.
+    let mut forzar = false;
     loop {
-        let ruta = {
+        let puesto = {
+            let _p = tomar(&poniendo);
             let e = m.lock().unwrap();
             if e.generacion != gen {
                 return;
             }
-            e.lista[e.indice].clone()
+            if e.pausado && !forzar {
+                false
+            } else {
+                let ruta = e.lista[e.indice].clone();
+                drop(e);
+                if let Err(err) = poner(&ruta) {
+                    eprintln!("no se pudo poner {}: {err:#}", ruta.display());
+                }
+                true
+            }
         };
-        if let Err(err) = poner(&ruta) {
-            eprintln!("no se pudo poner {}: {err:#}", ruta.display());
-        }
+        forzar = false;
         let mut e = m.lock().unwrap();
-        let mut limite = Instant::now() + e.intervalo;
+        if !puesto {
+            // En pausa antes de poner: esperar a reanudar (o a que nos reemplacen) y reintentar.
+            while e.generacion == gen && e.pausado {
+                e = cv.wait(e).unwrap();
+            }
+            continue;
+        }
+        let mut limite = limite_desde(e.intervalo);
         loop {
             if e.generacion != gen {
                 return;
             }
             if e.saltar {
                 e.saltar = false;
+                forzar = true;
                 break;
             }
             if e.pausado {
                 e = cv.wait(e).unwrap();
-                limite = Instant::now() + e.intervalo;
+                limite = limite_desde(e.intervalo);
                 continue;
             }
             let ahora = Instant::now();
@@ -121,18 +173,27 @@ fn bucle(inner: Arc<(Mutex<Estado>, Condvar)>, poner: Arc<Poner>, gen: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::{channel, Receiver};
     use std::thread::sleep;
 
-    type Log = Arc<Mutex<Vec<PathBuf>>>;
+    /// Margen generoso para esperar un cambio que SÍ tiene que ocurrir.
+    const ESPERA: Duration = Duration::from_secs(2);
 
-    fn grabador() -> (Log, Rotador) {
-        let log: Log = Default::default();
-        let l = log.clone();
+    /// Rotador cuyo `poner` manda cada ruta por un canal en vez de tocar Windows.
+    fn grabador() -> (Receiver<PathBuf>, Rotador) {
+        grabador_lento(Duration::ZERO)
+    }
+
+    /// Igual, pero `poner` tarda `demora` y recién después avisa (simula un `poner` en curso).
+    fn grabador_lento(demora: Duration) -> (Receiver<PathBuf>, Rotador) {
+        let (tx, rx) = channel();
+        let tx = Mutex::new(tx);
         let r = Rotador::nuevo(move |p: &Path| {
-            l.lock().unwrap().push(p.to_path_buf());
+            sleep(demora);
+            tx.lock().unwrap().send(p.to_path_buf()).unwrap();
             Ok(())
         });
-        (log, r)
+        (rx, r)
     }
 
     fn lista(prefijo: &str, n: usize) -> Vec<PathBuf> {
@@ -143,74 +204,103 @@ mod tests {
         Duration::from_millis(n)
     }
 
+    fn esperar(rx: &Receiver<PathBuf>) -> PathBuf {
+        rx.recv_timeout(ESPERA).expect("el cambio de fondo no llegó a tiempo")
+    }
+
     #[test]
     fn rota_en_orden_y_vuelve_al_principio() {
-        let (log, r) = grabador();
+        let (rx, r) = grabador();
         r.iniciar(lista("a", 3), ms(40));
-        sleep(ms(150));
+        let vistos: Vec<PathBuf> = (0..4).map(|_| esperar(&rx)).collect();
         r.detener();
-        let l = log.lock().unwrap().clone();
-        assert!(l.len() >= 4, "esperaba ≥ 4 cambios, hubo {}", l.len());
-        assert_eq!(&l[..4], &[lista("a", 3), lista("a", 1)].concat()[..]);
+        assert_eq!(vistos, [lista("a", 3), lista("a", 1)].concat());
     }
 
     #[test]
     fn siguiente_avanza_en_el_momento() {
-        let (log, r) = grabador();
+        let (rx, r) = grabador();
         r.iniciar(lista("a", 3), Duration::from_secs(10));
-        sleep(ms(30));
+        assert_eq!(esperar(&rx), lista("a", 1)[0]);
         r.siguiente();
-        sleep(ms(30));
-        assert_eq!(*log.lock().unwrap(), lista("a", 2));
+        assert_eq!(esperar(&rx), lista("a", 2)[1]);
+        sleep(ms(50));
+        assert!(rx.try_recv().is_err(), "no debería haber más cambios");
         r.detener();
     }
 
     #[test]
     fn pausar_frena_y_reanudar_sigue() {
-        let (log, r) = grabador();
+        let (rx, r) = grabador();
         r.iniciar(lista("a", 3), ms(30));
-        sleep(ms(10));
+        esperar(&rx);
         r.pausar();
         assert!(r.pausado());
-        let n = log.lock().unwrap().len();
-        sleep(ms(100));
-        assert_eq!(log.lock().unwrap().len(), n, "no cambia mientras está en pausa");
+        // Lo que ya se había puesto antes de pausar no cuenta.
+        let _ = rx.try_iter().count();
+        sleep(ms(150));
+        assert!(rx.try_recv().is_err(), "no cambia mientras está en pausa");
         r.reanudar();
-        sleep(ms(80));
-        assert!(log.lock().unwrap().len() > n);
+        assert!(!r.pausado());
+        esperar(&rx);
         r.detener();
     }
 
     #[test]
     fn detener_frena_y_queda_inactivo() {
-        let (log, r) = grabador();
+        let (rx, r) = grabador();
         r.iniciar(lista("a", 3), ms(20));
-        sleep(ms(10));
+        esperar(&rx);
         r.detener();
         assert!(!r.activo());
-        let n = log.lock().unwrap().len();
-        sleep(ms(80));
-        assert_eq!(log.lock().unwrap().len(), n);
+        let _ = rx.try_iter().count();
+        sleep(ms(100));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
     fn iniciar_de_nuevo_reemplaza_la_rotacion_anterior() {
-        let (log, r) = grabador();
+        let (rx, r) = grabador();
         r.iniciar(lista("a", 3), Duration::from_secs(10));
-        sleep(ms(20));
+        assert_eq!(esperar(&rx), lista("a", 1)[0]);
         r.iniciar(lista("b", 3), Duration::from_secs(10));
-        sleep(ms(40));
-        assert_eq!(*log.lock().unwrap(), [lista("a", 1), lista("b", 1)].concat());
+        assert_eq!(esperar(&rx), lista("b", 1)[0]);
+        sleep(ms(50));
+        assert!(rx.try_recv().is_err(), "la rotación vieja no debe seguir");
         assert!(r.activo());
         r.detener();
     }
 
     #[test]
     fn lista_vacia_no_arranca() {
-        let (log, r) = grabador();
+        let (rx, r) = grabador();
         r.iniciar(vec![], ms(10));
-        sleep(ms(30));
-        assert!(log.lock().unwrap().is_empty());
+        sleep(ms(50));
+        assert!(rx.try_recv().is_err());
         assert!(!r.activo());
+    }
+
+    #[test]
+    fn detener_espera_al_poner_en_curso() {
+        let (rx, r) = grabador_lento(ms(100));
+        r.iniciar(lista("a", 3), ms(5));
+        sleep(ms(20)); // el primer `poner` está en vuelo
+        r.detener();
+        // Al volver `detener` el `poner` en curso ya terminó y no vendrá otro.
+        assert_eq!(rx.try_iter().count(), 1);
+        sleep(ms(300));
+        assert!(rx.try_recv().is_err(), "nada después de detener");
+    }
+
+    #[test]
+    fn pausar_espera_al_poner_en_curso() {
+        let (rx, r) = grabador_lento(ms(100));
+        r.iniciar(lista("a", 3), ms(5));
+        sleep(ms(20));
+        r.pausar();
+        assert_eq!(rx.try_iter().count(), 1);
+        sleep(ms(300));
+        assert!(rx.try_recv().is_err(), "nada después de pausar");
+        r.detener();
     }
 }

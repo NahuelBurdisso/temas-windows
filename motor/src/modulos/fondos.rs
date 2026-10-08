@@ -31,9 +31,18 @@ pub fn lista_de(tema: &Tema) -> Result<(Vec<PathBuf>, Duration)> {
     Ok((lista, Duration::from_secs(conf.intervalo_seg)))
 }
 
-fn escribir_estilo(estilo: &RegValor) -> Result<()> {
+fn escribir_estilo(estilo: &RegValor, tile: &RegValor) -> Result<()> {
     registro::escribir(DESKTOP, "WallpaperStyle", estilo)?;
-    registro::escribir(DESKTOP, "TileWallpaper", &RegValor::Sz("0".into()))
+    registro::escribir(DESKTOP, "TileWallpaper", tile)
+}
+
+/// `TileWallpaper` a restaurar: lo capturado, o "0" si la captura no lo trae
+/// (captura vieja u `original.json` sembrado a mano).
+fn tile_de(captura: &Value) -> Result<RegValor> {
+    match captura.get("tile") {
+        None | Some(Value::Null) => Ok(RegValor::Sz("0".into())),
+        Some(v) => serde_json::from_value(v.clone()).context("captura de fondos: tile inválido"),
+    }
 }
 
 /// Copia que Windows guarda del fondo actual; sirve si el archivo original ya no existe.
@@ -53,6 +62,8 @@ impl Modulo for Fondos {
         "fondos"
     }
 
+    /// Si el fondo es un color sólido, Windows no tiene ruta de imagen: se cae a
+    /// `TranscodedWallpaper`, que puede contener una imagen anterior y no el color actual.
     fn capturar(&self, dir: &Path) -> Result<Value> {
         let actual = win::fondo_actual()?;
         let (fuente, ext) = if actual.is_file() {
@@ -68,13 +79,17 @@ impl Modulo for Fondos {
         let archivo = format!("fondo.{ext}");
         std::fs::copy(&fuente, dir.join(&archivo))
             .with_context(|| format!("copiar el fondo actual ({})", fuente.display()))?;
-        Ok(json!({ "archivo": archivo, "estilo": registro::leer(DESKTOP, "WallpaperStyle")? }))
+        Ok(json!({
+            "archivo": archivo,
+            "estilo": registro::leer(DESKTOP, "WallpaperStyle")?,
+            "tile": registro::leer(DESKTOP, "TileWallpaper")?,
+        }))
     }
 
     fn aplicar(&self, tema: &Tema) -> Result<()> {
         let conf = tema.conf.fondos.as_ref().context("el tema no define fondos")?;
         let (lista, intervalo) = lista_de(tema)?;
-        escribir_estilo(&RegValor::Sz(conf.estilo.wallpaper_style().into()))?;
+        escribir_estilo(&RegValor::Sz(conf.estilo.wallpaper_style().into()), &RegValor::Sz("0".into()))?;
         self.rotador.iniciar(lista, intervalo);
         Ok(())
     }
@@ -87,7 +102,7 @@ impl Modulo for Fondos {
         let destino = self.raiz.join(format!("fondo-actual.{ext}"));
         std::fs::copy(dir.join(archivo), &destino)
             .with_context(|| format!("copiar {archivo} a {}", destino.display()))?;
-        escribir_estilo(&serde_json::from_value(captura["estilo"].clone())?)?;
+        escribir_estilo(&serde_json::from_value(captura["estilo"].clone())?, &tile_de(captura)?)?;
         win::poner_fondo(&destino)
     }
 }
@@ -104,6 +119,17 @@ mod tests {
         let mut m = ordenar(l.clone(), Orden::Aleatorio);
         m.sort();
         assert_eq!(m, l);
+    }
+
+    #[test]
+    fn tile_de_usa_lo_capturado_o_cero_si_falta() {
+        assert_eq!(tile_de(&json!({"archivo": "fondo.jpg"})).unwrap(), RegValor::Sz("0".into()));
+        assert_eq!(tile_de(&json!({"tile": null})).unwrap(), RegValor::Sz("0".into()));
+        let capturado = serde_json::to_value(RegValor::Sz("1".into())).unwrap();
+        assert_eq!(tile_de(&json!({ "tile": capturado })).unwrap(), RegValor::Sz("1".into()));
+        let ausente = serde_json::to_value(RegValor::Ausente).unwrap();
+        assert_eq!(tile_de(&json!({ "tile": ausente })).unwrap(), RegValor::Ausente);
+        assert!(tile_de(&json!({"tile": 5})).is_err());
     }
 
     #[test]
