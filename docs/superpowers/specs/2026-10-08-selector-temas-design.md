@@ -210,6 +210,8 @@ Cada etapa termina en algo usable.
 1. **Núcleo + bandeja**: spike inicial de colores (confirmar que el acento cambia en vivo en barra/Inicio sin cerrar sesión);
    motor con `fondos`, `colores`, `bloqueo`, `terminal`; captura por módulo y restauración; menú de bandeja (sin "Abrir galería");
    migración desde `rotar.ps1`; temas Star Wars y Game of Thrones.
+   Resultado del spike de colores (2026-10-08): con `#C9A227`, modo oscuro y acento en barra, la barra de tareas,
+   el menú Inicio y las barras de título cambian en vivo sin cerrar sesión; al restaurar vuelve todo. Sin ajustes.
 2. **Galería + instalador**: ventana, detalle, casillas por módulo, "Nuevo tema", Ajustes, autostart, instalador NSIS en `D:\Programas\`.
 3. **Sonidos + intro.**
 4. **Íconos + protector de pantalla** (presentación y crawl).
